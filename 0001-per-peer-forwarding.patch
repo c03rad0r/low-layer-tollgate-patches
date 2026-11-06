@@ -1,0 +1,911 @@
+# Local, unmerged patch against FIPS 2ba790b (0.6.0-dev).
+#
+# Per-peer forwarding + runtime admission + local link price.
+#
+# (a) admission:
+#   - Node.acl_overrides: HashMap<NodeAddr, bool>
+#   - control set_admission {npub, action: allow|deny|clear}
+#   - fipsctl admission <peer> allow|deny|clear
+#   - authorize_peer checks the override before the file ACL
+#
+# (b) forwarding:
+#   - Node.forwarding_blocked: HashSet<NodeAddr>
+#   - control set_forwarding {npub, allow}
+#   - fipsctl set-forwarding <peer> allow|block
+#   - drop_policy_blocked_{packets,bytes} + policy_blocked_by_peer
+#   - transit drop in handle_session_datagram
+#
+# (c) price:
+#   - Node.link_prices: HashMap<NodeAddr, f64>
+#   - cost = link_cost * (1 + price) at every peer_costs construction
+#   - control set_price {npub, price|null}
+#   - fipsctl set-price <peer> <price|clear>
+#   - a price change forces one reevaluation on the next tick; the tree's
+#     hysteresis and hold-down still apply
+#
+# A blocked peer keeps its link, Noise session and local delivery (the payment
+# lane). Only datagrams it sends to a third party are not forwarded.
+#
+# DO NOT submit this to jmcorgan/fips. It is a local experiment patch; any
+# upstream conversation goes out of band via Signal after reproducible results,
+# per AGENTS.md.
+#
+diff --git a/src/bin/fipsctl.rs b/src/bin/fipsctl.rs
+index f042885..6952355 100644
+--- a/src/bin/fipsctl.rs
++++ b/src/bin/fipsctl.rs
+@@ -81,6 +81,27 @@ enum Commands {
+         /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
+         peer: String,
+     },
++    /// Set or clear a local price penalty on a peer
++    SetPrice {
++        /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
++        peer: String,
++        /// Non-negative multiplier addend, or `clear`
++        price: String,
++    },
++    /// Admit, refuse or release a peer at runtime
++    Admission {
++        /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
++        peer: String,
++        /// `allow`, `deny` or `clear` (fall back to the ACL files)
++        action: String,
++    },
++    /// Block or allow a peer's transit forwarding
++    SetForwarding {
++        /// Peer identifier: npub (bech32) or hostname from /etc/fips/hosts
++        peer: String,
++        /// `allow` or `block`
++        action: String,
++    },
+     /// Diagnose reachability of a mesh endpoint
+     Probe {
+         /// Target identifier: npub (bech32) or hostname from /etc/fips/hosts
+@@ -641,6 +662,54 @@ fn main() {
+             let npub = resolve_peer(peer);
+             build_command("disconnect", serde_json::json!({"npub": npub}))
+         }
++        Commands::SetPrice { peer, price } => {
++            let value = match price.as_str() {
++                "clear" | "none" | "-" => serde_json::Value::Null,
++                other => match other.parse::<f64>() {
++                    Ok(v) if v.is_finite() && v >= 0.0 => serde_json::json!(v),
++                    _ => {
++                        eprintln!("error: price must be a non-negative number or 'clear'");
++                        std::process::exit(1);
++                    }
++                },
++            };
++            let npub = resolve_peer(peer);
++            build_command(
++                "set_price",
++                serde_json::json!({"npub": npub, "price": value}),
++            )
++        }
++        Commands::Admission { peer, action } => {
++            let action = match action.as_str() {
++                "allow" | "allowed" => "allow",
++                "deny" | "denied" | "block" | "blocked" => "deny",
++                "clear" | "reset" | "file" => "clear",
++                _ => {
++                    eprintln!("error: action must be 'allow', 'deny' or 'clear'");
++                    std::process::exit(1);
++                }
++            };
++            let npub = resolve_peer(peer);
++            build_command(
++                "set_admission",
++                serde_json::json!({"npub": npub, "action": action}),
++            )
++        }
++        Commands::SetForwarding { peer, action } => {
++            let allow = match action.as_str() {
++                "allow" | "allowed" => true,
++                "block" | "blocked" => false,
++                _ => {
++                    eprintln!("error: action must be 'allow' or 'block'");
++                    std::process::exit(1);
++                }
++            };
++            let npub = resolve_peer(peer);
++            build_command(
++                "set_forwarding",
++                serde_json::json!({"npub": npub, "allow": allow}),
++            )
++        }
+         Commands::Probe {
+             target,
+             json,
+diff --git a/src/bin/fipstop/ui/routing.rs b/src/bin/fipstop/ui/routing.rs
+index 1cae2ca..952179f 100644
+--- a/src/bin/fipstop/ui/routing.rs
++++ b/src/bin/fipstop/ui/routing.rs
+@@ -286,6 +286,14 @@ fn draw_routing_stats(
+                 "Send Error",
+                 fwd_value(data, "drop_send_error_packets", "drop_send_error_bytes"),
+             ),
++            (
++                "Policy Blocked",
++                fwd_value(
++                    data,
++                    "drop_policy_blocked_packets",
++                    "drop_policy_blocked_bytes",
++                ),
++            ),
+         ],
+     ));
+     right.push(Line::from(""));
+diff --git a/src/control/commands.rs b/src/control/commands.rs
+index c423887..8834968 100644
+--- a/src/control/commands.rs
++++ b/src/control/commands.rs
+@@ -13,6 +13,9 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
+     match command {
+         "connect" => connect(node, params).await,
+         "disconnect" => disconnect(node, params).await,
++        "set_forwarding" => set_forwarding(node, params),
++        "set_admission" => set_admission(node, params),
++        "set_price" => set_price(node, params),
+         "probe_start" => probe_start(node, params).await,
+         "probe_poll" => probe_poll(node, params),
+         "probe_cancel" => probe_cancel(node, params).await,
+@@ -70,6 +73,82 @@ async fn disconnect(node: &mut Node, params: Option<&Value>) -> Response {
+     }
+ }
+ 
++/// Set or clear a peer's local price penalty.
++///
++/// Params: `{"npub": "npub1...", "price": <number>}`; `price: null` clears.
++fn set_price(node: &mut Node, params: Option<&Value>) -> Response {
++    let Some(params) = params else {
++        return Response::error("missing params for set_price");
++    };
++
++    let npub = match params.get("npub").and_then(|v| v.as_str()) {
++        Some(v) => v,
++        None => return Response::error("missing 'npub' parameter"),
++    };
++    let price = match params.get("price") {
++        None | Some(Value::Null) => None,
++        Some(value) => match value.as_f64() {
++            Some(v) => Some(v),
++            None => return Response::error("'price' must be a number or null"),
++        },
++    };
++
++    match node.api_set_price(npub, price) {
++        Ok(data) => Response::ok(data),
++        Err(msg) => Response::error(msg),
++    }
++}
++
++/// Admit, refuse or release a peer at runtime.
++///
++/// Params: `{"npub": "npub1...", "action": "allow" | "deny" | "clear"}`
++fn set_admission(node: &mut Node, params: Option<&Value>) -> Response {
++    let Some(params) = params else {
++        return Response::error("missing params for set_admission");
++    };
++
++    let npub = match params.get("npub").and_then(|v| v.as_str()) {
++        Some(v) => v,
++        None => return Response::error("missing 'npub' parameter"),
++    };
++    let action = match params.get("action").and_then(|v| v.as_str()) {
++        Some(v) => v,
++        None => return Response::error("missing 'action' parameter"),
++    };
++
++    debug!(npub = %npub, action = %action, "API runtime admission requested");
++
++    match node.api_set_admission(npub, action) {
++        Ok(data) => Response::ok(data),
++        Err(msg) => Response::error(msg),
++    }
++}
++
++/// Block or allow a peer's transit forwarding.
++///
++/// Params: `{"npub": "npub1...", "allow": false}`
++fn set_forwarding(node: &mut Node, params: Option<&Value>) -> Response {
++    let Some(params) = params else {
++        return Response::error("missing params for set_forwarding");
++    };
++
++    let npub = match params.get("npub").and_then(|v| v.as_str()) {
++        Some(v) => v,
++        None => return Response::error("missing 'npub' parameter"),
++    };
++    let allow = match params.get("allow").and_then(|v| v.as_bool()) {
++        Some(v) => v,
++        None => return Response::error("missing 'allow' boolean parameter"),
++    };
++
++    debug!(npub = %npub, allow = allow, "API forwarding policy requested");
++
++    match node.api_set_forwarding(npub, allow) {
++        Ok(data) => Response::ok(data),
++        Err(msg) => Response::error(msg),
++    }
++}
++
+ /// Start a diagnostic probe. Returns as soon as the job is admitted; the
+ /// stages run on the tick and the client polls for the report.
+ ///
+diff --git a/src/control/snapshots/show_routing.json b/src/control/snapshots/show_routing.json
+index c646463..e486672 100644
+--- a/src/control/snapshots/show_routing.json
++++ b/src/control/snapshots/show_routing.json
+@@ -70,6 +70,9 @@
+       "drop_no_route_bytes": 0,
+       "drop_no_route_packets": 0,
+       "drop_send_error_bytes": 0,
++      "drop_policy_blocked_bytes": 0,
++      "drop_policy_blocked_packets": 0,
++      "policy_blocked_by_peer": [],
+       "drop_send_error_packets": 0,
+       "forwarded_bytes": 0,
+       "forwarded_packets": 0,
+diff --git a/src/control/snapshots/show_status.json b/src/control/snapshots/show_status.json
+index 804414d..269ac13 100644
+--- a/src/control/snapshots/show_status.json
++++ b/src/control/snapshots/show_status.json
+@@ -19,6 +19,9 @@
+       "drop_no_route_bytes": 0,
+       "drop_no_route_packets": 0,
+       "drop_send_error_bytes": 0,
++      "drop_policy_blocked_bytes": 0,
++      "drop_policy_blocked_packets": 0,
++      "policy_blocked_by_peer": [],
+       "drop_send_error_packets": 0,
+       "forwarded_bytes": 0,
+       "forwarded_packets": 0,
+diff --git a/src/control/snapshots/show_status_composed.json b/src/control/snapshots/show_status_composed.json
+index 3630e36..f424b24 100644
+--- a/src/control/snapshots/show_status_composed.json
++++ b/src/control/snapshots/show_status_composed.json
+@@ -20,6 +20,9 @@
+       "drop_no_route_bytes": 0,
+       "drop_no_route_packets": 0,
+       "drop_send_error_bytes": 0,
++      "drop_policy_blocked_bytes": 0,
++      "drop_policy_blocked_packets": 0,
++      "policy_blocked_by_peer": [],
+       "drop_send_error_packets": 0,
+       "forwarded_bytes": 0,
+       "forwarded_packets": 0,
+diff --git a/src/control/snapshots/show_status_fallback.json b/src/control/snapshots/show_status_fallback.json
+index d419784..89842f6 100644
+--- a/src/control/snapshots/show_status_fallback.json
++++ b/src/control/snapshots/show_status_fallback.json
+@@ -20,6 +20,9 @@
+       "drop_no_route_bytes": 0,
+       "drop_no_route_packets": 0,
+       "drop_send_error_bytes": 0,
++      "drop_policy_blocked_bytes": 0,
++      "drop_policy_blocked_packets": 0,
++      "policy_blocked_by_peer": [],
+       "drop_send_error_packets": 0,
+       "forwarded_bytes": 0,
+       "forwarded_packets": 0,
+diff --git a/src/node/acl.rs b/src/node/acl.rs
+index ec286d7..1c21db2 100644
+--- a/src/node/acl.rs
++++ b/src/node/acl.rs
+@@ -826,12 +826,31 @@ impl Node {
+         transport_id: TransportId,
+         remote_addr: &TransportAddr,
+     ) -> Result<(), NodeError> {
++        let peer_node_addr = *peer_identity.node_addr();
++        if let Some(allow) = self.acl_overrides.get(&peer_node_addr) {
++            if *allow {
++                return Ok(());
++            }
++            warn!(
++                peer = %self.peer_display_name(&peer_node_addr),
++                npub = %peer_identity.npub(),
++                transport_id = %transport_id,
++                remote_addr = %remote_addr,
++                context = %context,
++                decision = "runtime-deny",
++                "Rejected peer by runtime admission override"
++            );
++            return Err(NodeError::AccessDenied(format!(
++                "peer {} rejected by runtime admission override",
++                peer_identity.npub()
++            )));
++        }
++
+         let decision = self.peer_acl.acl().check(peer_identity);
+         if decision.allowed() {
+             return Ok(());
+         }
+ 
+-        let peer_node_addr = *peer_identity.node_addr();
+         warn!(
+             peer = %self.peer_display_name(&peer_node_addr),
+             npub = %peer_identity.npub(),
+diff --git a/src/node/dataplane/forwarding.rs b/src/node/dataplane/forwarding.rs
+index 75466a5..9f48734 100644
+--- a/src/node/dataplane/forwarding.rs
++++ b/src/node/dataplane/forwarding.rs
+@@ -48,6 +48,27 @@ impl Node {
+ 
+         let my_addr = *self.node_addr();
+ 
++        // Per-peer forwarding policy: block transit from a peer whose role is
++        // paused. Local delivery (dest == my_addr) is deliberately unaffected,
++        // so the peer keeps its link, Noise session and payment path. This is
++        // the pause hook; it does not touch admission.
++        if datagram_ref.dest_addr != my_addr && self.forwarding_blocked.contains(from) {
++            // Count the drop against the sending peer as well as node-wide, so
++            // a multi-peer gate can subtract exactly the paused peer's bytes
++            // from that peer's meter (the link counter still counts them).
++            self.metrics()
++                .forwarding
++                .record_policy_blocked(*from, payload.len());
++            debug!(
++                from = %from,
++                src = %datagram_ref.src_addr,
++                dest = %datagram_ref.dest_addr,
++                bytes = payload.len(),
++                "Transit SessionDatagram blocked by peer forwarding policy"
++            );
++            return;
++        }
++
+         // Coordinate cache warming from plaintext session-layer headers. Runs
+         // ahead of both the delivery and the TTL decisions the core makes: the
+         // coords a peer put on the wire are equally valid whichever way those
+diff --git a/src/node/lifecycle/mod.rs b/src/node/lifecycle/mod.rs
+index d33bcc1..aec4cc2 100644
+--- a/src/node/lifecycle/mod.rs
++++ b/src/node/lifecycle/mod.rs
+@@ -3564,6 +3564,139 @@ impl Node {
+         }))
+     }
+ 
++    /// Set or clear a local price penalty for one peer.
++    ///
++    /// `price` is a non-negative multiplier addend applied to the peer's
++    /// measured link cost (`cost * (1 + price)`). The tree's parent selection
++    /// already compares effective depth with hysteresis, so this is a soft
++    /// preference: a price change forces one re-evaluation, but the hold-down
++    /// veto can still refuse the switch.
++    pub(crate) fn api_set_price(
++        &mut self,
++        npub: &str,
++        price: Option<f64>,
++    ) -> Result<serde_json::Value, String> {
++        let peer_identity =
++            PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub '{npub}': {e}"))?;
++        let node_addr = *peer_identity.node_addr();
++
++        match price {
++            None => {
++                self.link_prices.remove(&node_addr);
++            }
++            Some(value) => {
++                if !value.is_finite() || value < 0.0 {
++                    return Err(format!(
++                        "price must be a finite, non-negative number, got {value}"
++                    ));
++                }
++                self.link_prices.insert(node_addr, value);
++            }
++        }
++        self.price_revision = self.price_revision.wrapping_add(1);
++
++        info!(
++            npub = %npub,
++            peer = %node_addr,
++            price = ?price,
++            "API link price changed"
++        );
++
++        Ok(serde_json::json!({
++            "npub": npub,
++            "peer": node_addr.to_string(),
++            "price": price,
++            "effective_cost_factor": price.map(|p| 1.0 + p).unwrap_or(1.0),
++        }))
++    }
++
++    /// Admit, refuse or release a peer at runtime.
++    ///
++    /// `action` is `allow`, `deny` or `clear`. The override is checked before
++    /// the file ACL in [`Node::authorize_peer`], so it takes effect on the next
++    /// handshake rather than on the 1 s ACL-file tick. It is in-memory only; a
++    /// durable eviction must still write the ACL files.
++    pub(crate) fn api_set_admission(
++        &mut self,
++        npub: &str,
++        action: &str,
++    ) -> Result<serde_json::Value, String> {
++        let peer_identity =
++            PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub '{npub}': {e}"))?;
++        let node_addr = *peer_identity.node_addr();
++
++        let effect = match action {
++            "allow" | "allowed" => {
++                self.acl_overrides.insert(node_addr, true);
++                "allowed"
++            }
++            "deny" | "denied" | "block" | "blocked" => {
++                self.acl_overrides.insert(node_addr, false);
++                "denied"
++            }
++            "clear" | "reset" | "file" => {
++                self.acl_overrides.remove(&node_addr);
++                "cleared"
++            }
++            other => {
++                return Err(format!(
++                    "invalid action '{other}': expected allow, deny or clear"
++                ));
++            }
++        };
++
++        info!(
++            npub = %npub,
++            peer = %node_addr,
++            admission = effect,
++            "API runtime admission changed"
++        );
++
++        Ok(serde_json::json!({
++            "npub": npub,
++            "peer": node_addr.to_string(),
++            "admission": effect,
++        }))
++    }
++
++    /// Block or allow a peer's **transit** forwarding via the control API.
++    ///
++    /// Local delivery is never affected: the peer can still reach this node.
++    /// The block is independent of the peer table, so it survives a
++    /// disconnect/reconnect until explicitly cleared with `allow=true`.
++    pub(crate) fn api_set_forwarding(
++        &mut self,
++        npub: &str,
++        allow: bool,
++    ) -> Result<serde_json::Value, String> {
++        let peer_identity =
++            PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub '{npub}': {e}"))?;
++        let node_addr = *peer_identity.node_addr();
++
++        if !self.peers.contains_key(&node_addr) {
++            return Err(format!("peer not found: {npub}"));
++        }
++
++        if allow {
++            self.forwarding_blocked.remove(&node_addr);
++        } else {
++            self.forwarding_blocked.insert(node_addr);
++        }
++
++        info!(
++            npub = %npub,
++            peer = %node_addr,
++            forwarding = if allow { "allowed" } else { "blocked" },
++            "API peer forwarding policy changed"
++        );
++
++        Ok(serde_json::json!({
++            "npub": npub,
++            "peer": node_addr.to_string(),
++            "forwarding": if allow { "allowed" } else { "blocked" },
++        }))
++    }
++
+     /// Adopt an already-established UDP traversal and start the normal FIPS
+     /// Noise handshake over it.
+     ///
+diff --git a/src/node/metrics.rs b/src/node/metrics.rs
+index 743d7af..65d9d74 100644
+--- a/src/node/metrics.rs
++++ b/src/node/metrics.rs
+@@ -20,7 +20,8 @@ use crate::node::reject::{
+ };
+ use crate::node::stats::{
+     BloomStatsSnapshot, CongestionStatsSnapshot, DataplaneStatsSnapshot, ErrorSignalStatsSnapshot,
+-    ForwardingStatsSnapshot, LookupStatsSnapshot, NativeStatsSnapshot, TreeStatsSnapshot,
++    ForwardingStatsSnapshot, LookupStatsSnapshot, NativeStatsSnapshot, PolicyBlockedPeerSnapshot,
++    TreeStatsSnapshot,
+ };
+ 
+ /// An atomic counter.
+@@ -63,6 +64,13 @@ impl<T> std::ops::Deref for Padded<T> {
+     }
+ }
+ 
++/// Per-peer policy-blocked transit counters.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct PolicyBlockedCounters {
++    pub packets: u64,
++    pub bytes: u64,
++}
++
+ /// Forwarding metric counters.
+ #[derive(Default)]
+ pub struct ForwardingMetrics {
+@@ -113,6 +121,15 @@ pub struct ForwardingMetrics {
+     pub drop_mtu_exceeded_bytes: Counter,
+     pub drop_send_error_packets: Counter,
+     pub drop_send_error_bytes: Counter,
++    pub drop_policy_blocked_packets: Counter,
++    pub drop_policy_blocked_bytes: Counter,
++    /// Per-peer policy-blocked transit counters.
++    ///
++    /// A mutex, unlike the other counters, because attribution is keyed by
++    /// peer and the data path already holds `&mut self`; the lock is taken
++    /// only on a policy drop, which is the cold, deliberately rare path.
++    pub policy_blocked_by_peer:
++        std::sync::Mutex<std::collections::HashMap<crate::NodeAddr, PolicyBlockedCounters>>,
+     pub originated_packets: Counter,
+     pub originated_bytes: Counter,
+     pub route_tree_up: Counter,
+@@ -247,11 +264,50 @@ impl ForwardingMetrics {
+                 self.drop_send_error_packets.inc();
+                 self.drop_send_error_bytes.add(bytes);
+             }
++            ForwardingReject::PolicyBlocked => {
++                self.drop_policy_blocked_packets.inc();
++                self.drop_policy_blocked_bytes.add(bytes);
++            }
++        }
++    }
++
++    /// Record one transit datagram dropped by the peer's forwarding policy.
++    ///
++    /// Bumps the node-wide counter family and the per-peer attribution in the
++    /// same call so the two can never disagree.
++    pub fn record_policy_blocked(&self, peer: crate::NodeAddr, bytes: usize) {
++        self.drop_policy_blocked_packets.inc();
++        self.drop_policy_blocked_bytes.add(bytes as u64);
++        if let Ok(mut by_peer) = self.policy_blocked_by_peer.lock() {
++            let entry = by_peer.entry(peer).or_default();
++            entry.packets += 1;
++            entry.bytes += bytes as u64;
+         }
+     }
+ 
++    /// Per-peer attribution, sorted by peer address for stable output.
++    pub fn policy_blocked_by_peer(&self) -> Vec<PolicyBlockedPeerSnapshot> {
++        let mut rows: Vec<PolicyBlockedPeerSnapshot> = self
++            .policy_blocked_by_peer
++            .lock()
++            .map(|by_peer| {
++                by_peer
++                    .iter()
++                    .map(|(peer, counters)| PolicyBlockedPeerSnapshot {
++                        peer: hex::encode(peer.as_bytes()),
++                        packets: counters.packets,
++                        bytes: counters.bytes,
++                    })
++                    .collect()
++            })
++            .unwrap_or_default();
++        rows.sort_by(|a, b| a.peer.cmp(&b.peer));
++        rows
++    }
++
+     /// Sample every counter into a serializable snapshot.
+     pub fn snapshot(&self) -> ForwardingStatsSnapshot {
++        let policy_blocked_by_peer = self.policy_blocked_by_peer();
+         ForwardingStatsSnapshot {
+             received_packets: self.received_packets.get(),
+             received_bytes: self.received_bytes.get(),
+@@ -276,6 +332,9 @@ impl ForwardingMetrics {
+             drop_mtu_exceeded_bytes: self.drop_mtu_exceeded_bytes.get(),
+             drop_send_error_packets: self.drop_send_error_packets.get(),
+             drop_send_error_bytes: self.drop_send_error_bytes.get(),
++            drop_policy_blocked_packets: self.drop_policy_blocked_packets.get(),
++            drop_policy_blocked_bytes: self.drop_policy_blocked_bytes.get(),
++            policy_blocked_by_peer,
+             originated_packets: self.originated_packets.get(),
+             originated_bytes: self.originated_bytes.get(),
+             route_tree_up: self.route_tree_up.get(),
+@@ -779,6 +838,33 @@ impl MetricsRegistry {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn policy_blocked_attribution_is_per_peer_and_sums_to_node_totals() {
++        let m = ForwardingMetrics::default();
++        let a = crate::NodeAddr::from_bytes([0x0a; 16]);
++        let b = crate::NodeAddr::from_bytes([0x0b; 16]);
++        m.record_policy_blocked(a, 100);
++        m.record_policy_blocked(a, 50);
++        m.record_policy_blocked(b, 7);
++
++        let snap = m.snapshot();
++        assert_eq!(snap.drop_policy_blocked_packets, 3);
++        assert_eq!(snap.drop_policy_blocked_bytes, 157);
++
++        let row = |addr: crate::NodeAddr| {
++            snap.policy_blocked_by_peer
++                .iter()
++                .find(|r| r.peer == hex::encode(addr.as_bytes()))
++                .cloned()
++                .expect("peer row present")
++        };
++        let a_row = row(a);
++        let b_row = row(b);
++        assert_eq!((a_row.packets, a_row.bytes), (2, 150));
++        assert_eq!((b_row.packets, b_row.bytes), (1, 7));
++        assert_eq!(a_row.bytes + b_row.bytes, snap.drop_policy_blocked_bytes);
++    }
++
+     #[test]
+     fn native_record_drop_routes_every_reason_to_its_own_counter() {
+         use crate::native::link::DropReason;
+diff --git a/src/node/mod.rs b/src/node/mod.rs
+index d704df6..2ae0d1f 100644
+--- a/src/node/mod.rs
++++ b/src/node/mod.rs
+@@ -682,6 +682,37 @@ pub struct Node {
+     /// Indexed by NodeAddr (verified identity).
+     peers: HashMap<NodeAddr, ActivePeer>,
+ 
++    /// Local price penalty per peer, as a non-negative multiplier addend.
++    ///
++    /// `cost = link_cost * (1 + price)`. Set by the control socket; the tree's
++    /// parent selection already compares effective depth with hysteresis, so a
++    /// price change is a soft preference, not a forced switch. Empty means the
++    /// MMP cost is used unchanged.
++    link_prices: HashMap<NodeAddr, f64>,
++
++    /// Bumped on every price change so the periodic parent re-evaluation runs
++    /// on the next tick instead of waiting out `reeval_interval_secs`.
++    price_revision: u64,
++    last_price_revision: u64,
++
++    /// Runtime admission overrides from the control socket.
++    ///
++    /// `true` admits, `false` refuses. Checked in [`Node::authorize_peer`]
++    /// before the file ACL, so an admission change takes effect on the next
++    /// handshake instead of on the ACL file's 1 s tick. In-memory only: a
++    /// restart falls back to the files, so a durable eviction still writes
++    /// them.
++    acl_overrides: HashMap<NodeAddr, bool>,
++
++    /// Peers whose **transit** forwarding is blocked by local policy.
++    ///
++    /// A blocked peer keeps its link, Noise session and local delivery: it can
++    /// still reach this node (the payment lane), but datagrams it sends to a
++    /// third party are dropped instead of forwarded. The set is independent of
++    /// the peer table so a deny survives a disconnect/reconnect; an explicit
++    /// allow is required to clear it.
++    forwarding_blocked: std::collections::HashSet<NodeAddr>,
++
+     // === End-to-End Sessions ===
+     /// Session table for end-to-end encrypted sessions.
+     /// Keyed by remote NodeAddr.
+@@ -1131,6 +1162,11 @@ impl Node {
+             peer_machines: HashMap::new(),
+             peer_timers: HashMap::new(),
+             peers: HashMap::new(),
++            acl_overrides: HashMap::new(),
++            link_prices: HashMap::new(),
++            price_revision: 0,
++            last_price_revision: 0,
++            forwarding_blocked: std::collections::HashSet::new(),
+             sessions: HashMap::new(),
+             identity_cache: identities::IdentityCache::new(),
+             pending_tun_packets: HashMap::new(),
+@@ -1315,6 +1351,11 @@ impl Node {
+             peer_machines: HashMap::new(),
+             peer_timers: HashMap::new(),
+             peers: HashMap::new(),
++            acl_overrides: HashMap::new(),
++            link_prices: HashMap::new(),
++            price_revision: 0,
++            last_price_revision: 0,
++            forwarding_blocked: std::collections::HashSet::new(),
+             sessions: HashMap::new(),
+             identity_cache: identities::IdentityCache::new(),
+             pending_tun_packets: HashMap::new(),
+diff --git a/src/node/reject.rs b/src/node/reject.rs
+index 9c981b8..131c764 100644
+--- a/src/node/reject.rs
++++ b/src/node/reject.rs
+@@ -391,6 +391,10 @@ pub enum ForwardingReject {
+     /// channel closed, etc.). Tracked via
+     /// [`ForwardingStats::drop_send_error_packets`](crate::node::stats::ForwardingStats).
+     SendError,
++    /// Transit datagram dropped because the peer's local forwarding policy is
++    /// blocked. Tracked via
++    /// [`ForwardingStats::drop_policy_blocked_packets`](crate::node::stats::ForwardingStats).
++    PolicyBlocked,
+ }
+ 
+ /// Transport-layer rejection reasons.
+@@ -511,6 +515,7 @@ mod tests {
+             ForwardingReject::NoRoute,
+             ForwardingReject::MtuExceeded,
+             ForwardingReject::SendError,
++            ForwardingReject::PolicyBlocked,
+         ];
+         for v in variants {
+             let r = RejectReason::Forwarding(v);
+diff --git a/src/node/stats.rs b/src/node/stats.rs
+index 62b27d5..31498d5 100644
+--- a/src/node/stats.rs
++++ b/src/node/stats.rs
+@@ -360,6 +360,14 @@ impl NodeStats {
+ 
+ // --- Snapshot types (copyable, serializable) ---
+ 
++#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
++pub struct PolicyBlockedPeerSnapshot {
++    /// Peer node address, lowercase hex.
++    pub peer: String,
++    pub packets: u64,
++    pub bytes: u64,
++}
++
+ #[derive(Clone, Debug, Default, Serialize)]
+ pub struct ForwardingStatsSnapshot {
+     pub received_packets: u64,
+@@ -385,6 +393,12 @@ pub struct ForwardingStatsSnapshot {
+     pub drop_mtu_exceeded_bytes: u64,
+     pub drop_send_error_packets: u64,
+     pub drop_send_error_bytes: u64,
++    pub drop_policy_blocked_packets: u64,
++    pub drop_policy_blocked_bytes: u64,
++    /// Per-peer share of `drop_policy_blocked_*`. Node-wide totals above stay
++    /// authoritative; this is the attribution a multi-peer gate needs so it
++    /// can subtract only the paused peer's bytes from that peer's meter.
++    pub policy_blocked_by_peer: Vec<PolicyBlockedPeerSnapshot>,
+     pub originated_packets: u64,
+     pub originated_bytes: u64,
+     pub route_tree_up: u64,
+diff --git a/src/node/tests/acl.rs b/src/node/tests/acl.rs
+index 48f56a6..b88bd3a 100644
+--- a/src/node/tests/acl.rs
++++ b/src/node/tests/acl.rs
+@@ -26,6 +26,47 @@ fn deny_path(dir: &tempfile::TempDir) -> PathBuf {
+     dir.path().join("peers.deny")
+ }
+ 
++#[tokio::test]
++async fn runtime_admission_override_beats_the_file_acl() {
++    use crate::node::acl::PeerAclContext;
++
++    let (dir, mut node) = make_acl_node();
++    let allowed = Identity::generate();
++    let denied = Identity::generate();
++    std::fs::write(allow_path(&dir), format!("{}\n", allowed.npub())).unwrap();
++    std::fs::write(deny_path(&dir), "ALL\n").unwrap();
++    node.reload_peer_acl().await;
++
++    let allowed_id = PeerIdentity::from_pubkey_full(allowed.pubkey_full());
++    let denied_id = PeerIdentity::from_pubkey_full(denied.pubkey_full());
++    let addr = || TransportAddr::from_string("127.0.0.1:9000");
++    let transport = || TransportId::new(1);
++    let check = |node: &Node, id: &PeerIdentity| {
++        node.authorize_peer(id, PeerAclContext::InboundHandshake, transport(), &addr())
++    };
++
++    // Baseline: the files allow one and deny the other.
++    assert!(check(&node, &allowed_id).is_ok());
++    assert!(check(&node, &denied_id).is_err());
++
++    // Runtime deny overrides a file allow.
++    node.api_set_admission(&allowed.npub(), "deny").unwrap();
++    assert!(check(&node, &allowed_id).is_err());
++
++    // Runtime allow overrides a file deny.
++    node.api_set_admission(&denied.npub(), "allow").unwrap();
++    assert!(check(&node, &denied_id).is_ok());
++
++    // `clear` falls back to the files.
++    node.api_set_admission(&allowed.npub(), "clear").unwrap();
++    node.api_set_admission(&denied.npub(), "clear").unwrap();
++    assert!(check(&node, &allowed_id).is_ok());
++    assert!(check(&node, &denied_id).is_err());
++
++    // An unknown action is refused, not silently treated as clear.
++    assert!(node.api_set_admission(&allowed.npub(), "maybe").is_err());
++}
++
+ #[tokio::test]
+ async fn test_outbound_connect_denied_by_denylist() {
+     let (dir, mut node) = make_acl_node();
+diff --git a/src/node/tree.rs b/src/node/tree.rs
+index 82c601f..5a7a123 100644
+--- a/src/node/tree.rs
++++ b/src/node/tree.rs
+@@ -377,7 +377,7 @@ impl Node {
+             .peers
+             .iter()
+             .filter(|(_, peer)| peer.has_srtt())
+-            .map(|(addr, peer)| (*addr, peer.link_cost()))
++            .map(|(addr, peer)| (*addr, self.price_adjusted_cost(addr, peer)))
+             .collect();
+         // No peers are excluded from parent candidacy on this branch; the
+         // non-full/leaf skip is a next-only shell refinement.
+@@ -663,7 +663,11 @@ impl Node {
+     /// the same switch flow as TreeAnnounce-triggered switches.
+     async fn check_periodic_parent_reeval(&mut self) {
+         let interval_secs = self.config().node.tree.reeval_interval_secs;
+-        if interval_secs == 0 {
++        // A local price change forces one evaluation on the next tick, even if
++        // the configured interval has not elapsed. The hold-down veto still
++        // applies to the resulting discretionary switch.
++        let price_forced = self.price_revision != self.last_price_revision;
++        if interval_secs == 0 && !price_forced {
+             return;
+         }
+ 
+@@ -675,19 +679,21 @@ impl Node {
+         let now = std::time::Instant::now();
+         let interval = std::time::Duration::from_secs(interval_secs);
+ 
+-        if let Some(last) = self.last_parent_reeval
++        if !price_forced
++            && let Some(last) = self.last_parent_reeval
+             && now.duration_since(last) < interval
+         {
+             return;
+         }
+ 
+         self.last_parent_reeval = Some(now);
++        self.last_price_revision = self.price_revision;
+ 
+         let peer_costs: BTreeMap<NodeAddr, f64> = self
+             .peers
+             .iter()
+             .filter(|(_, peer)| peer.has_srtt())
+-            .map(|(addr, peer)| (*addr, peer.link_cost()))
++            .map(|(addr, peer)| (*addr, self.price_adjusted_cost(addr, peer)))
+             .collect();
+         // No peers are excluded from parent candidacy on this branch; the
+         // non-full/leaf skip is a next-only shell refinement.
+@@ -839,7 +845,7 @@ impl Node {
+             .peers
+             .iter()
+             .filter(|(_, peer)| peer.has_srtt())
+-            .map(|(addr, peer)| (*addr, peer.link_cost()))
++            .map(|(addr, peer)| (*addr, self.price_adjusted_cost(addr, peer)))
+             .collect();
+ 
+         // Wall-clock seconds stamped onto the new declaration; monotonic ms for
+@@ -899,3 +905,35 @@ impl Node {
+         }
+     }
+ }
++
++/// Apply a local price penalty to a measured link cost.
++///
++/// `price` is a non-negative multiplier addend: 0 leaves the MMP cost alone,
++/// 1 doubles it, and so on. Negative values clamp to 0 so a control command
++/// can never make a link look cheaper than measured.
++fn priced_cost(base: f64, price: f64) -> f64 {
++    base * (1.0 + price.max(0.0))
++}
++
++impl Node {
++    /// Measured link cost with this node's local price preference applied.
++    fn price_adjusted_cost(&self, addr: &NodeAddr, peer: &crate::peer::ActivePeer) -> f64 {
++        priced_cost(
++            peer.link_cost(),
++            self.link_prices.get(addr).copied().unwrap_or(0.0),
++        )
++    }
++}
++
++#[cfg(test)]
++mod price_tests {
++    use super::priced_cost;
++
++    #[test]
++    fn price_is_a_non_negative_multiplier() {
++        assert_eq!(priced_cost(1.5, 0.0), 1.5);
++        assert_eq!(priced_cost(1.5, 1.0), 3.0);
++        assert_eq!(priced_cost(1.5, -2.0), 1.5);
++        assert!(priced_cost(1.0, 0.5) > priced_cost(1.0, 0.0));
++    }
++}
